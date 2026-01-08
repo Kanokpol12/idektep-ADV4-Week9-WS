@@ -1,0 +1,350 @@
+import time, cv2, serial, logging, math
+import numpy as np
+from logging import info, error
+from coloredlogs import install 
+
+# ======================================
+# [0] SETUP & LOGGING
+# ======================================
+install(level="info", format="%(asctime)s - %(message)s")
+logging.basicConfig(level=logging.INFO)
+
+# ======================================
+# [1] CALIBRATION & CONFIGURATION
+# ======================================
+# 1.1 Dynamic Pixel-to-MM Calibration (จากโค้ดใหม่)
+PIXEL_DISTANCES = [0, 150, 280] 
+FACTORS_X       = [0.52, 0.460, 0.410] 
+FACTOR_Y_CONST  = 0.4821 
+
+# 1.2 Tray Grid Configuration (จากโค้ดใหม่)
+TRAY_ROWS = 3                                                    
+TRAY_COLS = 5                                                    
+START_X_POS = 53.0  # Top-Left Slot X                                                    
+START_Y_POS = 155.0 # Top-Left Slot Y                                                   
+PITCH_X = -27.0     # ระยะห่าง X
+PITCH_Y = -27.0     # ระยะห่าง Y
+
+# Generate Tray Matrix
+TRAY_MATRIX = []
+for r in range(TRAY_ROWS):
+    for c in range(TRAY_COLS):
+        slot_x = START_X_POS + (c * PITCH_X)
+        slot_y = START_Y_POS + (r * PITCH_Y)
+        TRAY_MATRIX.append({"id": f"R{r}-C{c}", "x": slot_x, "y": slot_y})
+
+# 1.3 Safety Limits
+LIMIT_X_MIN = -55.0; LIMIT_X_MAX = 53.0                                                
+LIMIT_Y_MIN = 101.0; LIMIT_Y_MAX = 155.0                                                 
+
+# 1.4 Mechanical Offsets
+y_fix = 30 
+
+X_ROBOT_OFFSET = 0                                                         
+Y_ROBOT_OFFSET = 128 - y_fix                                                                                                                                              
+
+# 1.5 Pick Zone Configuration (เพิ่มมาจากโค้ดเก่า)
+# ปรับค่า 2 ตัวนี้ให้เส้นสีเหลือง ขนานไปกับขอบถาดของคุณ
+PICK_ZONE_TOP_RATIO = 0.65    # จุดเริ่มเส้นด้านบน (0.0 - 1.0)
+PICK_ZONE_BOTTOM_RATIO = 0.62 # จุดจบเส้นด้านล่าง (ถ้าค่าน้อยกว่าด้านบน เส้นจะเอียงซ้าย / ถ้ามากกว่าจะเอียงขวา)
+
+# ======================================
+# [2] SERIAL COMMUNICATION
+# ======================================
+def init_serial():
+    """เชื่อมต่อ Serial Port"""
+    try:
+        # ใช้port cartesian เช่น COM12 
+        return serial.Serial(port="COM5", baudrate=115200, timeout=1)                  
+    except serial.SerialException as e:
+        error(f"Serial Port Error: {e}")
+        return None
+
+def send_state(serial_port, data):
+    try:
+        serial_port.write(f"{data}\n".encode('utf-8'))
+        info(f"Sent to Robot: {data}")
+    except serial.SerialException as e:
+        error(f"Error Sending data: {e}")
+
+def receive_state(serial_port):
+    """รอรับข้อมูลตอบกลับจาก Robot (Blocking with Timeout)"""
+    success_keywords = ["Success", "ok", "Sucess", "Ready"] 
+    error_keywords = ["Error", "limit"]
+    
+    try:
+        info("Waiting for Robot...")
+        start_wait = time.time()
+        while True:
+            if serial_port.in_waiting > 0:
+                line = serial_port.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    info(f"Robot says: {line}")
+                    if any(s in line for s in success_keywords):
+                        info("Robot Finished Action.")
+                        break
+                    if any(s in line for s in error_keywords):
+                        error("Robot reported ERROR!")
+                        break
+            
+            # Timeout 10 วินาที
+            if time.time() - start_wait > 10: 
+                error("Robot Timeout! (10s)")
+                break
+            time.sleep(0.05)
+    except Exception as e:
+        error(f"Serial Receive Error: {e}")
+
+# =========================================
+# [3] LOGIC: CALCULATION & VISION
+# =========================================
+def snap_to_tray_grid(robot_x, robot_y):
+    """ดึงพิกัดเข้าหาหลุมที่ใกล้ที่สุด (Tray Snapping)"""
+    closest_slot = None
+    min_dist = float('inf')
+    
+    for slot in TRAY_MATRIX:
+        dist = math.sqrt((robot_x - slot["x"])**2 + (robot_y - slot["y"])**2)
+        if dist < min_dist:
+            min_dist = dist
+            closest_slot = slot
+
+    if closest_slot:
+        # Log การ Snap
+        if min_dist > 20.0:
+            info(f"DISTORTION FIX: Raw({robot_x:.1f},{robot_y:.1f}) -> Force Snap to {closest_slot['id']}")
+        else:
+            info(f"SNAP! [{closest_slot['id']}] to Fixed({closest_slot['x']:.1f},{closest_slot['y']:.1f})")
+        return closest_slot["x"], closest_slot["y"]
+    
+    return robot_x, robot_y 
+
+def object_position_cal(frame, cx, cy):
+    """แปลง Pixel เป็น mm (พร้อม Dynamic Factor)"""
+    h, w, _ = frame.shape
+    cam_center = (int(w / 2), int(h / 2))
+    
+    offset_x_pixel = cx - cam_center[0]
+    offset_y_pixel = cy - cam_center[1]
+    
+    dist_from_center_x = abs(offset_x_pixel)
+    current_factor_x = np.interp(dist_from_center_x, PIXEL_DISTANCES, FACTORS_X)
+    
+    real_x_mm = offset_x_pixel * current_factor_x
+    real_y_mm = offset_y_pixel * FACTOR_Y_CONST 
+
+    cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+    cv2.line(frame, cam_center, (cx, cy), (255, 255, 255), 1)
+    return real_x_mm, real_y_mm
+
+def object_position_check(data_stream, stamp_choose, target_count=10): 
+    """เช็คความนิ่ง + คำนวณพิกัด + Snap"""
+    if len(data_stream) < target_count: return None
+    
+    recent_data = data_stream[-target_count:]
+    xs = [d[0] for d in recent_data]
+    ys = [d[1] for d in recent_data]
+   
+    # เช็คว่าค่านิ่งพอไหม (แกว่งไม่เกิน 3mm)
+    if (max(xs) - min(xs) < 3.0) and (max(ys) - min(ys) < 3.0): 
+        avg_x_cam = sum(xs) / len(xs)
+        avg_y_cam = sum(ys) / len(ys)
+        
+        # แปลงเป็นพิกัด Robot
+        estimated_robot_x = avg_x_cam + X_ROBOT_OFFSET
+        estimated_robot_y = avg_y_cam + Y_ROBOT_OFFSET
+        
+        # Snap เข้าหลุม
+        final_x, final_y = snap_to_tray_grid(estimated_robot_x, estimated_robot_y)
+        
+        # Safety Limit
+        clamped_x = max(LIMIT_X_MIN, min(final_x, LIMIT_X_MAX))
+        clamped_y = max(LIMIT_Y_MIN, min(final_y, LIMIT_Y_MAX))
+        
+        return f"G{stamp_choose} X{clamped_x:.1f} Y{clamped_y:.1f}"
+    
+    return None 
+
+def color_detection_choose(c_choose, frame):
+    """สร้าง Mask สี (รวมทุกสีจากทั้ง 2 โค้ด)"""
+    frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    kernel = np.ones((5,5), np.uint8)
+    mask = None
+    
+    # รองรับทั้งชื่อเต็มและชื่อย่อ
+    if c_choose in ["red", "r"]:
+        mask = cv2.inRange(frame_hsv, np.array([0, 100, 100]), np.array([10, 255, 255])) + \
+               cv2.inRange(frame_hsv, np.array([160, 100, 100]), np.array([179, 255, 255]))
+               
+    elif c_choose in ["blue", "b"]:
+       mask = cv2.inRange(frame_hsv, np.array([111, 20, 113]), np.array([153, 255, 255]))
+       
+    elif c_choose in ["green", "g"]:
+       mask = cv2.inRange(frame_hsv, np.array([62, 60, 146]), np.array([91, 255, 255]))
+       
+    elif c_choose in ["orange", "o"]:
+       mask = cv2.inRange(frame_hsv, np.array([0, 115, 243]), np.array([64, 255, 255]))
+       
+    elif c_choose in ["yellow", "y"]: # เพิ่ม Yellow กลับมาให้
+       mask = cv2.inRange(frame_hsv, np.array([25, 100, 100]), np.array([35, 255, 255]))
+    
+    if mask is not None:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+# ==============================================
+# [4] CAMERA PROCESS (ON-DEMAND)
+# ==============================================
+def scan_and_command(c_choose, ser):
+    """เปิดกล้อง -> หา -> สั่ง -> ปิดกล้อง (รองรับเส้น Pick Zone แบบเอียง)"""
+    info(f"CAMERA OPEN: Waiting for color '{c_choose}'...")
+    cap = cv2.VideoCapture(0)  # !!! เช็ค Index กล้อง (0 หรือ 1)
+    cap.set(3, 640); cap.set(4, 480)
+    for _ in range(5): cap.read() # Warmup
+    
+    data_list = []
+    command_sent = False
+    
+    try:
+        while True: 
+            ret, frame = cap.read()
+            if not ret: break
+            
+            h, w, _ = frame.shape
+            
+            # --- [CALCULATE TILTED LINE] ---
+            # คำนวณพิกัดแกน X ของเส้น บนและล่าง
+            line_x_top = int(w * PICK_ZONE_TOP_RATIO)
+            line_x_bot = int(w * PICK_ZONE_BOTTOM_RATIO)
+
+            # วาดเส้นเอียง (จากจุดบน ไปจุดล่าง)
+            cv2.line(frame, (line_x_top, 0), (line_x_bot, h), (0, 255, 255), 2)
+            cv2.putText(frame, "PICK ZONE -->", (line_x_top + 10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            # ----------------------------------------
+            
+            mask_c = color_detection_choose(c_choose, frame)
+            
+            if mask_c is not None:
+                contours, _ = cv2.findContours(mask_c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                valid_cnts = []
+                
+                for cnt in contours:
+                    if cv2.contourArea(cnt) > 500:
+                        M = cv2.moments(cnt)
+                        if M["m00"] > 0:
+                            cx = int(M["m10"] / M["m00"])
+                            cy = int(M["m01"] / M["m00"]) # ต้องใช้ cy มาคำนวณ
+
+                            # --- [LOGIC CHANGED] CHECK TILTED ZONE ---
+                            # สูตรคำนวณจุดตัดแกน X บนเส้น ที่ความสูง cy นี้
+                            # x = x_top + (ระยะห่าง x * (ตำแหน่ง y / ความสูงทั้งหมด))
+                            threshold_x_at_cy = int(line_x_top + (line_x_bot - line_x_top) * (cy / h))
+                            
+                            # เช็คว่า cx ของวัตถุ อยู่เลยเส้นที่คำนวณมาหรือไม่
+                            if cx > threshold_x_at_cy:
+                                valid_cnts.append(cnt)
+                
+                if valid_cnts:
+                    c = max(valid_cnts, key=cv2.contourArea)
+                    M = cv2.moments(c)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"]); cy = int(M["m01"] / M["m00"])
+                        
+                        raw_x, raw_y = object_position_cal(frame, cx, cy)
+                        data_list.append((raw_x, raw_y))
+                        if len(data_list) > 50: data_list.pop(0)
+
+                        cmd_to_send = object_position_check(data_list, stamp_choose=1, target_count=10)
+                        
+                        if cmd_to_send:
+                            x,y,w_rect,h_rect = cv2.boundingRect(c)
+                            cv2.rectangle(frame, (x,y), (x+w_rect, y+h_rect), (0,255,0), 3)
+                            
+                            # แสดงจุดที่ใช้เช็คบนเส้นด้วย เพื่อ Debug
+                            threshold_x_now = int(line_x_top + (line_x_bot - line_x_top) * (cy / h))
+                            cv2.circle(frame, (threshold_x_now, cy), 5, (0, 0, 255), -1) # จุดแดงบนเส้นที่ตรงกับวัตถุ
+
+                            cv2.putText(frame, f"SENDING...", (20, 240), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                            cv2.imshow("SCANNING...", frame)
+                            cv2.waitKey(500) 
+                            
+                            if ser:
+                                ser.reset_input_buffer() 
+                                send_state(ser, cmd_to_send)
+                            else:
+                                info(f"TEST MODE: {cmd_to_send}")
+                            
+                            command_sent = True
+                            break 
+
+            cv2.putText(frame, f"LOOKING FOR: {c_choose} ('q' to CANCEL)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.imshow("SCANNING...", frame)
+            if cv2.waitKey(1) == ord('q'):
+                info("Scan Cancelled.")
+                break
+                
+    except Exception as e:
+        error(f"Scan Error: {e}")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        info("Camera Closed.")
+        
+    return command_sent
+# ==================================
+# [5] MAIN LOOP
+# ==================================
+def main():
+    ser = init_serial()
+    
+    # --- SETUP ROBOT ---
+    if ser:
+        info("SERIAL CONNECTED. Setting Home...")
+        time.sleep(2)
+        ser.reset_input_buffer()
+        send_state(ser, "home")   
+        receive_state(ser)        
+        
+        ser.reset_input_buffer()
+        send_state(ser, "ready")  
+        receive_state(ser)
+    else:
+        info("RUNNING IN TEST MODE (No Serial)")
+
+    info("SYSTEM STARTED.")
+    
+    try:
+        while True:
+            # 1. รับ Input จากผู้ใช้
+            print("\n" + "="*50)
+            c_input = input(" >> Enter color (red/blue/green/orange/yellow) or 'q': ").strip().lower() 
+            
+            if c_input in ['q', 'exit']: break
+            
+            # Map input to known colors (support both full and short names)
+            valid_colors = ['red', 'r', 'blue', 'b', 'green', 'g', 'orange', 'o', 'yellow', 'y']
+            if c_input not in valid_colors:
+                error("Invalid color!"); continue
+            
+            success = scan_and_command(c_input, ser)
+            
+            if success:
+                if ser:
+                    receive_state(ser) # รอหุ่นยนต์ทำงาน
+                else:
+                    time.sleep(3)
+                info("TASK COMPLETE.")
+            else:
+                info("Operation Cancelled.")
+
+    except KeyboardInterrupt:
+        info("User Interrupted.")
+    finally:
+        if ser: ser.close()
+        info("PROGRAM ENDED.")
+
+if __name__ == '__main__':
+    main()
